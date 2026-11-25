@@ -1,0 +1,9 @@
+syntax = "proto3";
+option go_package = "./event";
+
+message UserEvent {
+  string user_id = 1;
+  string action = 2;
+  int64 timestamp = 3;
+  string message = 4;
+}
