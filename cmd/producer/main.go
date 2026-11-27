@@ -36,20 +36,30 @@ func main() {
 
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers":  broker,
-		"enable.idempotence": true, // Гарантирует отсутствие дублей при ретраях брокера
-		"acks":               "all",
-		"retries":            5,
+		"enable.idempotence": true,  // Гарантирует отсутствие дублей при ретраях брокера
+		"acks":               "all", // продюсер ждёт подтверждения записи сообщения не только от брокера-лидера партиции, но и от всех актуальных реплик
+		"retries":            5,     // продюсер сделает до 5 повторных попыток отправить сообщение, если предыдущая попытка завершилась временной ошибкой
 	})
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to create producer: %v", err)
 	}
 
-	defer func() {
-		p.Flush(5000)
-		p.Close()
+	// Фоновая обработка системных событий продюсера (ошибки, логи)
+	go func() {
+		for e := range p.Events() {
+			if err, ok := e.(kafka.Error); ok {
+				log.Printf("Kafka producer error: %v", err)
+			}
+		}
 	}()
 
-	userEvent := &pb.UserEvent{}
+	defer func() {
+		unflushed := p.Flush(5000)
+		if unflushed > 0 {
+			log.Printf("Warning: %d messages were not delivered before shutdown", unflushed)
+		}
+		p.Close()
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /events", func(w http.ResponseWriter, r *http.Request) {
@@ -67,23 +77,29 @@ func main() {
 		}
 
 		// Собираем сообщение в Kafka
-		userEvent.Timestamp = time.Now().Unix() // or time.Now().Format(time.RFC3339)
+		userEvent := &pb.UserEvent{
+			Timestamp: time.Now().Unix(), // or time.Now().Format(time.RFC3339)
+			Action:    "POST",
+			Message:   event.Message,
+		}
 		if event.UserID == "" {
 			v7, err := uuid.NewV7()
 			if err != nil {
-				log.Fatal(err)
+				log.Printf("failed to generate uuid: %v", err)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
 			}
 			userEvent.UserId = v7.String()
 		} else {
 			userEvent.UserId = event.UserID
 		}
-		userEvent.Action = "POST"
-		userEvent.Message = event.Message
 
 		// Сериализуем в бинарный формат []byte
 		data, err := proto.Marshal(userEvent)
 		if err != nil {
-			log.Fatalf("failed to marshal protobuf: %v", err)
+			log.Printf("failed to marshal protobuf: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
 		}
 
 		// Канал для синхронного подтверждения доставки в HTTP-хендлере
@@ -103,15 +119,22 @@ func main() {
 		}
 
 		// Ждем подтверждения от брокера Kafka
-		e := <-deliveryChan
-		m := e.(*kafka.Message)
-		if m.TopicPartition.Error != nil {
-			log.Printf("Delivery failed: %v", m.TopicPartition.Error)
-			http.Error(w, "kafka delivery failed", http.StatusInternalServerError)
+		select {
+		case e := <-deliveryChan:
+			m := e.(*kafka.Message)
+			if m.TopicPartition.Error != nil {
+				log.Printf("Delivery failed: %v", m.TopicPartition.Error)
+				http.Error(w, "kafka delivery failed", http.StatusInternalServerError)
+				return
+			}
+		case <-time.After(10 * time.Second):
+			log.Println("Kafka delivery timeout")
+			http.Error(w, "kafka delivery timeout", http.StatusGatewayTimeout)
 			return
 		}
 
-		log.Printf("Delivered event %s to %v", userEvent.UserId, m.TopicPartition)
+		log.Printf("Delivered event %s to %v", userEvent.UserId, topic)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{
@@ -121,8 +144,10 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:    ":8080",
-		Handler: mux,
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
 	// Graceful shutdown при остановке контейнера
