@@ -16,6 +16,10 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	pb "app/proto"
 )
 
@@ -28,6 +32,42 @@ curl -X POST http://localhost:8080/events \
 type Event struct {
 	UserID  string `json:"user_id"`
 	Message string `json:"message"`
+}
+
+// --- Метрики Prometheus ---
+var eventsPublished = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "producer_events_published_total",
+		Help: "Количество событий, отправленных в Kafka",
+	},
+	[]string{"status"}, // "success" или "error"
+)
+
+var httpRequestDuration = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "Время обработки HTTP-запросов в секундах",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
+	},
+	[]string{"method", "path"},
+)
+
+// Middleware для автоматического сбора HTTP-метрик
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Не засоряем метрики опросами самого Prometheus и кубера
+		if r.URL.Path == "/metrics" || r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now() // Засекли старт
+
+		next.ServeHTTP(w, r) // Выполнили основной хендлер (например, POST /events)
+
+		// Записали, сколько секунд занял весь запрос
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(time.Since(start).Seconds())
+	})
 }
 
 func main() {
@@ -64,6 +104,16 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
+
+	// Эндпоинт для Prometheus
+	mux.Handle("GET /metrics", promhttp.Handler())
+
+	// Healthcheck для readinessProbe / livenessProbe
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
 	mux.HandleFunc("POST /events", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -115,6 +165,7 @@ func main() {
 		}, deliveryChan)
 
 		if err != nil {
+			eventsPublished.WithLabelValues("error").Inc()
 			log.Printf("failed to write message to kafka: %v", err)
 			http.Error(w, "failed to publish event", http.StatusInternalServerError)
 			return
@@ -125,15 +176,19 @@ func main() {
 		case e := <-deliveryChan:
 			m := e.(*kafka.Message)
 			if m.TopicPartition.Error != nil {
+				eventsPublished.WithLabelValues("error").Inc()
 				log.Printf("Delivery failed: %v", m.TopicPartition.Error)
 				http.Error(w, "kafka delivery failed", http.StatusInternalServerError)
 				return
 			}
 		case <-time.After(10 * time.Second):
+			eventsPublished.WithLabelValues("error").Inc()
 			log.Println("Kafka delivery timeout")
 			http.Error(w, "kafka delivery timeout", http.StatusGatewayTimeout)
 			return
 		}
+
+		eventsPublished.WithLabelValues("success").Inc()
 
 		log.Printf("Delivered event %s to %v", userEvent.UserId, topic)
 
@@ -147,7 +202,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:         ":8080",
-		Handler:      mux,
+		Handler:      metricsMiddleware(mux),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
